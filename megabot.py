@@ -11,21 +11,29 @@ API_KEY = "8330502624:AAEr5TliWy66wQm9EX02OUuGeWoslYjWeUY"
 CHAT_ID = "7743162708"
 bot = telebot.TeleBot(API_KEY)
 
-# ==== OpenAI GPT API Key (pobiera z Railway Variables) ====
 import openai
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
-# ====== Kolejka sygnałów (dzielona przez wszystkie wątki) ======
 signal_queue = []
 dashboard_signals = []
 
-# ====== BINANCE PAIRS (do analizy) ======
+# ====== PAIRS NA KAŻDEJ GIEŁDZIE ======
 BINANCE_PAIRS = [
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT", "TRXUSDT", "XLMUSDT", "EOSUSDT", "HBARUSDT",
-    "LOKAUSDT", "SPXUSDT", "OMNIUSDT", "SUIUSDT", "MDTUSDT", "BLURUSDT", "PNGUSDT", "HOPRUSDT",
-    "ASMUSDT", "BONKUSDT", "PENGUUSDT", "JASMYUSDT", "CLVUSDT", "TRUMPUSDT", "ONDOUSDT", "SPKUSDT", "CFXUSDT", "SAROSUSDT"
+    "LOKAUSDT", "SUIUSDT", "MDTUSDT", "BLURUSDT", "PNGUSDT", "HOPRUSDT",
+    "ASMUSDT", "BONKUSDT", "PENGUUSDT", "JASMYUSDT", "CLVUSDT", "TRUMPUSDT", "ONDOUSDT", "CFXUSDT"
+]
+
+COINBASE_PAIRS = [
+    "BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD", "TRX-USD", "XLM-USD", "EOS-USD", "HBAR-USD",
+    "LOKA-USD", "SUI-USD", "MDT-USD", "BLUR-USD", "PNG-USD", "JASMY-USD", "CLV-USD", "TRUMP-USD"
+]
+
+KRAKEN_PAIRS = [
+    "XBTUSD", "ETHUSD", "SOLUSD", "ADAUSD", "TRXUSD", "XLMUSD", "EOSUSD", "HBARUSD",
+    "LOKAUSD", "SUIUSD", "MDTUSD", "BLURUSD", "PNGUSD", "JASMYUSD", "CLVUSD", "TRUMPUSD"
 ]
 
 # ====== AI Funkcja – analiza sentymentu/komentarz GPT ======
@@ -53,31 +61,31 @@ def ai_comment(coin, typ, reason, custom_prompt=None):
     except Exception as e:
         return f"(Błąd GPT: {e})"
 
-# ====== Pump Detector (wolumen + zmiana ceny, na Binance) ======
+# ========== Binance ==========
 def fetch_binance_ticker(symbol):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=10"
     data = requests.get(url).json()
-    if not isinstance(data, list):
-        return None
+    if not isinstance(data, list) or len(data) < 2:
+        return None, None
     closes = [float(x[4]) for x in data]
     vols = [float(x[5]) for x in data]
     return closes, vols
 
-def pump_detector_thread():
+def pump_detector_binance_thread():
     while True:
         for pair in BINANCE_PAIRS:
             try:
                 closes, vols = fetch_binance_ticker(pair)
-                if closes is None:
+                if closes is None or vols is None:
                     continue
                 change = ((closes[-1] - closes[0]) / closes[0]) * 100
                 avg_vol = sum(vols[:-1]) / max(1, len(vols)-1)
                 if change >= 5 or vols[-1] > avg_vol*3:
-                    reason = f"Pump! Zmiana {change:.2f}%, wolumen {vols[-1]:.2f}"
+                    reason = f"Pump (Binance)! Zmiana {change:.2f}%, wolumen {vols[-1]:.2f}"
                     ai = ai_comment(pair, "Pump Detector", reason)
                     sygnal = {
                         "type": "pump",
-                        "coin": pair,
+                        "coin": f"BINANCE:{pair}",
                         "reason": reason,
                         "ai": ai,
                         "score": 8.0 + min(change/10, 2),
@@ -85,94 +93,82 @@ def pump_detector_thread():
                     }
                     signal_queue.append(sygnal)
             except Exception as e:
-                print(f"PumpDetector error {pair}: {e}")
-        time.sleep(300)  # co 5 min
+                print(f"PumpDetectorBinance error {pair}: {e}")
+        time.sleep(300)
 
-# ====== Trend Hunter (EMA/RSI – uproszczony przykład) ======
-def fetch_binance_ohlc(symbol):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=5m&limit=50"
-    data = requests.get(url).json()
-    closes = [float(x[4]) for x in data]
-    return closes
+# ========== Coinbase ==========
+def fetch_coinbase_ticker(symbol):
+    url = f"https://api.exchange.coinbase.com/products/{symbol}/candles?granularity=60&limit=10"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    data = requests.get(url, headers=headers).json()
+    if not isinstance(data, list) or len(data) < 2:
+        return None, None
+    closes = [float(x[4]) for x in reversed(data)]
+    vols = [float(x[5]) for x in reversed(data)]
+    return closes, vols
 
-def ema(data, window):
-    alpha = 2/(window+1)
-    ema_val = data[0]
-    for price in data[1:]:
-        ema_val = (price*alpha) + (ema_val*(1-alpha))
-    return ema_val
-
-def trend_hunter_thread():
+def pump_detector_coinbase_thread():
     while True:
-        for pair in BINANCE_PAIRS:
+        for pair in COINBASE_PAIRS:
             try:
-                closes = fetch_binance_ohlc(pair)
-                if len(closes) < 30:
+                closes, vols = fetch_coinbase_ticker(pair)
+                if closes is None or vols is None:
                     continue
-                ema9 = ema(closes[-15:], 9)
-                ema21 = ema(closes[-30:], 21)
-                if ema9 > ema21:
-                    reason = "EMA9>EMA21 - bullish trend"
-                    ai = ai_comment(pair, "Trend Hunter", reason)
+                change = ((closes[-1] - closes[0]) / closes[0]) * 100
+                avg_vol = sum(vols[:-1]) / max(1, len(vols)-1)
+                if change >= 5 or vols[-1] > avg_vol*3:
+                    reason = f"Pump (Coinbase)! Zmiana {change:.2f}%, wolumen {vols[-1]:.2f}"
+                    ai = ai_comment(pair, "Pump Detector", reason)
                     sygnal = {
-                        "type": "trend",
-                        "coin": pair,
+                        "type": "pump",
+                        "coin": f"COINBASE:{pair}",
                         "reason": reason,
                         "ai": ai,
-                        "score": 8.5,
+                        "score": 8.0 + min(change/10, 2),
                         "timestamp": time.time()
                     }
                     signal_queue.append(sygnal)
             except Exception as e:
-                print(f"TrendHunter error {pair}: {e}")
-        time.sleep(600)  # co 10 min
+                print(f"PumpDetectorCoinbase error {pair}: {e}")
+        time.sleep(300)
 
-# ====== New Listings Detector (na Binance) ======
-_last_pairs = set()
+# ========== Kraken ==========
+def fetch_kraken_ticker(symbol):
+    url = f"https://api.kraken.com/0/public/OHLC?pair={symbol}&interval=1"
+    data = requests.get(url).json()
+    result = data.get("result", {})
+    key = [k for k in result.keys() if k != "last"]
+    if not key or not isinstance(result[key[0]], list) or len(result[key[0]]) < 2:
+        return None, None
+    candles = result[key[0]]
+    closes = [float(x[4]) for x in candles]
+    vols = [float(x[6]) for x in candles]
+    return closes, vols
 
-def new_listings_thread():
-    global _last_pairs
+def pump_detector_kraken_thread():
     while True:
-        try:
-            url = "https://api.binance.com/api/v3/exchangeInfo"
-            data = requests.get(url).json()
-            pairs = set([x['symbol'] for x in data['symbols'] if x['quoteAsset']=='USDT'])
-            new_pairs = pairs - _last_pairs if _last_pairs else set()
-            for pair in new_pairs:
-                reason = "Nowa para na Binance!"
-                ai = ai_comment(pair, "New Listing", reason)
-                sygnal = {
-                    "type": "new_listing",
-                    "coin": pair,
-                    "reason": reason,
-                    "ai": ai,
-                    "score": 7.5,
-                    "timestamp": time.time()
-                }
-                signal_queue.append(sygnal)
-            _last_pairs = pairs
-        except Exception as e:
-            print(f"NewListings error: {e}")
-        time.sleep(1800)  # co 30 min
-
-# ====== AI Sentyment Thread (z GPT) ======
-def sentiment_ai_thread():
-    while True:
-        import random
-        pair = random.choice(BINANCE_PAIRS)
-        prompt = f"Przeanalizuj najnowsze newsy i sentyment wokół {pair} na rynku kryptowalut. Czy są powody do wzrostu lub spadku w najbliższych godzinach? Podsumuj krótko po polsku."
-        ai = ai_comment(pair, "Sentiment AI", "Analiza newsów/sentymentu", custom_prompt=prompt)
-        if random.random() > 0.8:
-            sygnal = {
-                "type": "sentiment",
-                "coin": pair,
-                "reason": "AI sentyment: " + ai,
-                "ai": ai,
-                "score": 7.2,
-                "timestamp": time.time()
-            }
-            signal_queue.append(sygnal)
-        time.sleep(900)
+        for pair in KRAKEN_PAIRS:
+            try:
+                closes, vols = fetch_kraken_ticker(pair)
+                if closes is None or vols is None:
+                    continue
+                change = ((closes[-1] - closes[0]) / closes[0]) * 100
+                avg_vol = sum(vols[:-1]) / max(1, len(vols)-1)
+                if change >= 5 or vols[-1] > avg_vol*3:
+                    reason = f"Pump (Kraken)! Zmiana {change:.2f}%, wolumen {vols[-1]:.2f}"
+                    ai = ai_comment(pair, "Pump Detector", reason)
+                    sygnal = {
+                        "type": "pump",
+                        "coin": f"KRAKEN:{pair}",
+                        "reason": reason,
+                        "ai": ai,
+                        "score": 8.0 + min(change/10, 2),
+                        "timestamp": time.time()
+                    }
+                    signal_queue.append(sygnal)
+            except Exception as e:
+                print(f"PumpDetectorKraken error {pair}: {e}")
+        time.sleep(300)
 
 # ====== Decision Layer – kompresja i selekcja sygnałów ======
 def decision_layer_thread():
@@ -186,8 +182,8 @@ def decision_layer_thread():
             coins[s["coin"]].append(s)
         for coin, signals in coins.items():
             types = set([s['type'] for s in signals])
-            if len(types) >= 2:  # Jeśli co najmniej 2 różne strategie zgłaszają sygnał
-                msg = f"⚡️ *MEGA SYGNAŁ* na {coin}!\n"
+            if len(types) >= 1:  # minimum 1 strategia dla uproszczenia
+                msg = f"⚡️ *SYGNAŁ* na {coin}!\n"
                 for s in signals:
                     msg += f"- {s['type']} ({s['reason']}) [score: {s['score']}]\n"
                     if "ai" in s and s["ai"]:
@@ -196,7 +192,7 @@ def decision_layer_thread():
                 bot.send_message(CHAT_ID, msg, parse_mode="Markdown")
                 dashboard_signals.append({
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "type": "MEGA SYGNAŁ",
+                    "type": "SYGNAŁ",
                     "coin": coin,
                     "message": msg
                 })
@@ -228,7 +224,7 @@ HTML_TEMPLATE = """
         <tr>
             <th>Czas</th>
             <th>Typ</th>
-            <th>Krypto</th>
+            <th>Giełda:Krypto</th>
             <th>Wiadomość</th>
         </tr>
         {% for s in signals %}
@@ -284,13 +280,11 @@ def run_flask():
 
 # ====== Uruchom wszystkie wątki ======
 if __name__ == "__main__":
-    threading.Thread(target=pump_detector_thread, daemon=True).start()
-    threading.Thread(target=trend_hunter_thread, daemon=True).start()
-    threading.Thread(target=new_listings_thread, daemon=True).start()
-    threading.Thread(target=sentiment_ai_thread, daemon=True).start()
+    threading.Thread(target=pump_detector_binance_thread, daemon=True).start()
+    threading.Thread(target=pump_detector_coinbase_thread, daemon=True).start()
+    threading.Thread(target=pump_detector_kraken_thread, daemon=True).start()
     threading.Thread(target=decision_layer_thread, daemon=True).start()
     threading.Thread(target=run_flask, daemon=True).start()
     print("🚀 MegaBot uruchomiony!")
     while True:
         time.sleep(60)
-
