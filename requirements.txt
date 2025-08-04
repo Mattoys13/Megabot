@@ -1,0 +1,4 @@
+requests
+telebot
+flask
+openai>=1.0.0
